@@ -1,155 +1,222 @@
-import streamlit as st
-from dotenv import load_dotenv
 import os
-import pinecone
-from langchain.embeddings import OpenAIEmbeddings
-from langchain.vectorstores import Pinecone
-from langchain.chat_models import ChatOpenAI
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain.document_loaders import PyPDFLoader, TextLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from io import StringIO
+import io
+import uuid
+import time
+import streamlit as st
 
-# Load environment variables
-load_dotenv()
-
-# --- Konfigurasi Awal Streamlit ---
-st.set_page_config(page_title="Chatbot Tanya Jawab dengan Pinecone & OpenAI", page_icon="💬")
-st.title("💬 Chatbot Tanya Jawab")
-st.markdown("Unggah dokumen Anda (PDF atau TXT) untuk membuat basis pengetahuan, lalu ajukan pertanyaan kepada chatbot.")
-
-# --- Sidebar untuk API Keys dan Konfigurasi ---
-with st.sidebar:
-    st.header("Konfigurasi")
-    openai_api_key = st.text_input("OpenAI API Key", type="password", help="Dapatkan dari platform.openai.com")
-    pinecone_api_key = st.text_input("Pinecone API Key", type="password", help="Dapatkan dari app.pinecone.io")
-    pinecone_environment = st.text_input("Pinecone Environment", help="Contoh: us-west-2")
-    pinecone_index_name = st.text_input("Nama Indeks Pinecone", "my-rag-index", help="Nama indeks Pinecone yang akan digunakan")
-
-    if not (openai_api_key and pinecone_api_key and pinecone_environment and pinecone_index_name):
-        st.warning("Mohon masukkan semua API Key dan konfigurasi Pinecone di sidebar.")
-        st.stop()
-
-    os.environ["OPENAI_API_KEY"] = openai_api_key
-    
-    st.subheader("Unggah Dokumen")
-    uploaded_file = st.file_uploader("Pilih file PDF atau TXT", type=["pdf", "txt"])
-    process_button = st.button("Proses Dokumen")
-
-# --- Inisialisasi Pinecone dan OpenAI ---
-@st.cache_resource
-def initialize_pinecone_and_openai(pinecone_api_key, pinecone_environment, pinecone_index_name):
-    try:
-        pinecone.init(api_key=pinecone_api_key, environment=pinecone_environment)
-        embeddings = OpenAIEmbeddings(model="text-embedding-ada-002") # Dimenasi 1536
-        
-        # Cek apakah indeks ada, jika tidak, buat
-        if pinecone_index_name not in pinecone.list_indexes():
-            pinecone.create_index(name=pinecone_index_name, dimension=1536, metric="cosine")
-            st.info(f"Indeks Pinecone '{pinecone_index_name}' berhasil dibuat.")
-        
-        vectorstore = Pinecone(index_name=pinecone_index_name, embedding=embeddings)
-        return embeddings, vectorstore
-    except Exception as e:
-        st.error(f"Gagal menginisialisasi Pinecone atau OpenAI Embeddings: {e}")
-        return None, None
-
-embeddings, vectorstore = initialize_pinecone_and_openai(pinecone_api_key, pinecone_environment, pinecone_index_name)
-
-if not embeddings or not vectorstore:
+# ---- Dependencies ----
+try:
+    import chromadb
+    # PERUBAHAN: Impor CloudClient, bukan hanya HttpClient
+    from chromadb import CloudClient
+    from chromadb.utils import embedding_functions
+except Exception as e:
+    st.error(f"Gagal mengimpor chromadb. Pastikan sudah terpasang. Error: {e}")
     st.stop()
 
-# --- Fungsi untuk Memproses Dokumen ---
-def process_document(uploaded_file, embeddings, vectorstore):
-    if uploaded_file is not None:
-        file_extension = uploaded_file.name.split('.')[-1]
-        temp_file_path = f"./temp_uploaded_file.{file_extension}"
+try:
+    import tiktoken
+except Exception: tiktoken = None
+try:
+    import docx
+except Exception: docx = None
+try:
+    import PyPDF2
+except Exception: PyPDF2 = None
+try:
+    from openai import OpenAI
+except Exception: OpenAI = None
 
-        with open(temp_file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
+st.set_page_config(page_title="Chroma Uploader + RAG Chat", page_icon="📚", layout="wide")
 
-        loader = None
-        if file_extension == "pdf":
-            loader = PyPDFLoader(temp_file_path)
-        elif file_extension == "txt":
-            loader = TextLoader(temp_file_path)
-        else:
-            st.error("Format file tidak didukung. Mohon unggah file PDF atau TXT.")
-            return
+st.title("📚 Chroma Uploader + RAG Chat")
+st.caption("Upload dokumen → simpan ke Chroma → tanya dokumen dengan sitasi")
 
-        if loader:
-            with st.spinner("Membaca dan memproses dokumen..."):
-                documents = loader.load()
-                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-                texts = text_splitter.split_documents(documents)
-                
-                # Mengunggah ke Pinecone secara batch
-                batch_size = 100
-                total_batches = (len(texts) + batch_size - 1) // batch_size
-                progress_bar = st.progress(0)
-
-                for i in range(total_batches):
-                    start_index = i * batch_size
-                    end_index = min((i + 1) * batch_size, len(texts))
-                    batch = texts[start_index:end_index]
-                    
-                    # Konversi Document objek menjadi string untuk embedding
-                    # dan kemudian menjadi tuple (id, embedding, metadata) untuk upsert langsung
-                    # atau menggunakan vectorstore.add_documents() jika itu mendukung batching
-                    
-                    # Untuk kesederhanaan, kita akan menggunakan add_documents, yang menangani embedding secara internal
-                    # namun perlu diingat bahwa ini akan memanggil API embedding untuk setiap dokumen dalam batch.
-                    # Jika Anda perlu mengoptimalkan, Anda bisa mendapatkan embedding secara terpisah dan kemudian upsert langsung.
-                    
-                    vectorstore.add_documents(batch)
-                    progress = (i + 1) / total_batches
-                    progress_bar.progress(progress)
-                
-                st.success(f"Dokumen '{uploaded_file.name}' berhasil diunggah ke Pinecone.")
-            os.remove(temp_file_path)
-
-# --- Proses Dokumen saat tombol ditekan ---
-if process_button:
-    if uploaded_file:
-        process_document(uploaded_file, embeddings, vectorstore)
+# ---------------- Sidebar: Credentials & Settings ----------------
+with st.sidebar:
+    st.header("🔐 Koneksi Chroma")
+    chroma_mode = st.radio("Mode", ["Chroma Cloud", "Local (Persistent)"], index=0)
+    if chroma_mode == "Chroma Cloud":
+        st.info("Salin kredensial dari halaman 'Connect' database Anda di Chroma Cloud.")
+        # PERUBAHAN: Menghapus input Host yang tidak lagi diperlukan
+        tenant = st.text_input("Tenant", value="", help="Salin dari halaman koneksi database Anda.")
+        database = st.text_input("Database", value="n8nsmallcr", help="Salin dari halaman koneksi database Anda.")
+        chroma_api_key = st.text_input("Chroma API Key", type="password", help="Buat dengan tombol 'Create API key'.")
     else:
-        st.warning("Mohon unggah file terlebih dahulu.")
+        persist_dir = st.text_input("Persist Directory", value="./chroma_data")
+        tenant = database = chroma_api_key = None
 
-# --- Inisialisasi Model Chatbot ---
-@st.cache_resource
-def get_conversation_chain(vectorstore):
-    llm = ChatOpenAI(model_name="gpt-3.5-turbo", temperature=0.7) # Model 3.5-turbo
-    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
-    conversation_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vectorstore.as_retriever(),
-        memory=memory
+    st.divider()
+    st.header("🧠 Embedding Model")
+    embed_choice = st.selectbox("Embedding function", ["OpenAIEmbeddings", "Sentence-Transformers (all-MiniLM-L6-v2)"], index=0)
+    openai_api_key = st.text_input("OPENAI_API_KEY (untuk embeddings & jawaban)", type="password", value=os.getenv("OPENAI_API_KEY", ""))
+    openai_model = st.text_input("OpenAI Chat Model", value=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    collection_name = st.text_input("Collection Name", value="docs")
+    top_k = st.slider("Top-K retrieval", 1, 10, 5)
+    chunk_size = st.slider("Chunk size (chars)", 300, 2000, 900, step=50)
+    chunk_overlap = st.slider("Chunk overlap (chars)", 0, 400, 150, step=10)
+
+# ---------------- Helpers ----------------
+def chunk_text(text, size=900, overlap=150):
+    if not text: return []
+    if tiktoken:
+        try:
+            enc = tiktoken.get_encoding("cl100k_base")
+            toks = enc.encode(text)
+            chunks, i, tok_size, tok_overlap = [], 0, max(50, size // 4), max(0, overlap // 4)
+            while i < len(toks):
+                chunks.append(enc.decode(toks[i:i+tok_size]))
+                i += max(1, tok_size - tok_overlap)
+            return chunks
+        except Exception: pass
+    chunks, i = [], 0
+    while i < len(text):
+        chunks.append(text[i:i+size])
+        i += max(1, size - overlap)
+    return chunks
+
+def read_file(uploaded_file) -> str:
+    name = uploaded_file.name.lower()
+    data = uploaded_file.read()
+    if name.endswith((".txt", ".md")): return data.decode("utf-8", errors="ignore")
+    if name.endswith(".pdf"):
+        if PyPDF2 is None: raise RuntimeError("PyPDF2 belum terpasang.")
+        reader = PyPDF2.PdfReader(io.BytesIO(data))
+        return "\n\n".join([p.extract_text() or "" for p in reader.pages])
+    if name.endswith(".docx"):
+        if docx is None: raise RuntimeError("python-docx belum terpasang.")
+        return "\n".join([p.text for p in docx.Document(io.BytesIO(data)).paragraphs])
+    return data.decode("utf-8", errors="ignore")
+
+@st.cache_resource(show_spinner=False)
+def get_chroma_client():
+    if chroma_mode == "Chroma Cloud":
+        if not (tenant and database and chroma_api_key):
+            st.error("Lengkapi Tenant, Database, dan Chroma API Key.")
+            st.stop()
+        try:
+            # PERUBAHAN BESAR: Menggunakan CloudClient, bukan HttpClient
+            client = CloudClient(
+                tenant=tenant,
+                database=database,
+                api_key=chroma_api_key
+            )
+            client.heartbeat() # Cek koneksi
+            return client
+        except Exception as e:
+            st.error(f"Gagal konek ke Chroma Cloud: {e}")
+            st.stop()
+    else: # Local Persistent
+        try:
+            client = chromadb.PersistentClient(path=persist_dir)
+            client.heartbeat()
+            return client
+        except Exception as e:
+            st.error(f"Gagal membuat PersistentClient: {e}")
+            st.stop()
+
+@st.cache_resource(show_spinner=False)
+def get_embedding_function():
+    if embed_choice == "OpenAIEmbeddings":
+        if not openai_api_key:
+            st.error("OPENAI_API_KEY diperlukan.")
+            st.stop()
+        return embedding_functions.OpenAIEmbeddingFunction(
+            api_key=openai_api_key, model_name="text-embedding-3-small"
+        )
+    else:
+        return embedding_functions.SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+
+def get_or_create_collection():
+    client = get_chroma_client()
+    emb_func = get_embedding_function()
+    return client.get_or_create_collection(
+        name=collection_name, embedding_function=emb_func, metadata={"hnsw:space": "cosine"}
     )
-    return conversation_chain
 
-conversation_chain = get_conversation_chain(vectorstore)
+# Sisa kode (fungsi RAG, tabs) tidak perlu diubah secara signifikan
+# ... (kode lainnya tetap sama) ...
+def build_prompt(question, results):
+    numbered = []
+    for i, (doc, meta) in enumerate(results, start=1):
+        src, chunk_idx = meta.get("source", "?"), meta.get("chunk", "?")
+        numbered.append(f"[{i}] Source: {src} (chunk {chunk_idx}) — {doc.strip()}")
+    context = "\n\n".join(numbered)
+    system = "Anda adalah asisten yang menjawab hanya dari konteks berikut. Berikan jawaban ringkas dan tambahkan sitasi [n] pada klaim penting."
+    user = f"Pertanyaan: {question}\n\nKonteks:\n{context}\n\nInstruksi: Jawab ringkas, lalu daftar sumber yang dirujuk."
+    return system, user
 
-# --- Inisialisasi Riwayat Chat ---
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+def openai_answer(system_msg, user_msg):
+    if OpenAI is None or not openai_api_key:
+        st.error("OPENAI_API_KEY tidak tersedia/valid.")
+        st.stop()
+    client = OpenAI(api_key=openai_api_key)
+    try:
+        resp = client.chat.completions.create(
+            model=openai_model, messages=[{"role":"system","content":system_msg}, {"role":"user","content":user_msg}],
+            temperature=0.2)
+        return resp.choices[0].message.content
+    except Exception as e:
+        st.error(f"Gagal memanggil OpenAI API: {e}")
+        return None
 
-# --- Tampilkan Riwayat Chat ---
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+tab_up, tab_list, tab_chat = st.tabs(["⬆️ Upload", "📄 List Dokumen", "💬 Chat"])
 
-# --- Input Pengguna ---
-if prompt := st.chat_input("Tanyakan sesuatu tentang dokumen Anda..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+with tab_up:
+    st.subheader("Upload Dokumen")
+    uploader = st.file_uploader("Pilih file (.pdf, .docx, .txt, .md)", accept_multiple_files=True, type=["pdf","docx","txt","md"])
+    if uploader and st.button("🚀 Upload ke Chroma"):
+        collection = get_or_create_collection()
+        with st.spinner("Memproses & mengunggah..."):
+            total_chunks = 0
+            for f in uploader:
+                try:
+                    text = read_file(f)
+                    chunks = chunk_text(text, size=chunk_size, overlap=chunk_overlap)
+                    if not chunks:
+                        st.warning(f"File {f.name} tidak menghasilkan chunk.")
+                        continue
+                    ids = [f"{f.name}-{i}-{uuid.uuid4().hex[:8]}" for i in range(len(chunks))]
+                    metadatas = [{"source": f.name, "chunk": i} for i in range(len(chunks))]
+                    collection.add(documents=chunks, ids=ids, metadatas=metadatas)
+                    total_chunks += len(chunks)
+                except Exception as e:
+                    st.error(f"Gagal upload {f.name}: {e}")
+            if total_chunks > 0:
+                st.success(f"Selesai. Total chunks diunggah: {total_chunks}")
 
-    with st.chat_message("assistant"):
-        with st.spinner("Mencari jawaban..."):
-            response = conversation_chain({"question": prompt})
-            st.markdown(response["chat_history"][-1].content) # Ambil respons terbaru dari chat_history
-    st.session_state.messages.append({"role": "assistant", "content": response["chat_history"][-1].content})
+with tab_list:
+    st.subheader("Daftar Dokumen")
+    if st.button("🔄 Refresh Daftar"):
+        collection = get_or_create_collection()
+        count = collection.count()
+        st.write(f"Total entri (chunks) dalam koleksi: {count}")
+        if count > 0:
+            with st.spinner("Mengambil daftar sumber..."):
+                entries = collection.get(limit=count, include=["metadatas"])
+                sources = sorted(list(set(m.get('source', 'unknown') for m in entries['metadatas'])))
+                st.dataframe(sources, use_container_width=True)
 
-st.markdown("---")
-st.info("Catatan: Chatbot ini menggunakan Retrieval-Augmented Generation (RAG). Jawaban didasarkan pada dokumen yang Anda unggah dan kemampuan generatif dari OpenAI GPT-3.5-turbo.")
+with tab_chat:
+    st.subheader("Tanya Dokumen Anda")
+    question = st.text_input("Pertanyaan")
+    if st.button("Kirim Pertanyaan") and question.strip():
+        collection = get_or_create_collection()
+        with st.spinner("Mengambil konteks dari Chroma..."):
+            qres = collection.query(query_texts=[question], n_results=top_k, include=["documents", "metadatas"])
+        docs = (qres.get("documents") or [[]])[0]
+        metas = (qres.get("metadatas") or [[]])[0]
+        if not docs:
+            st.warning("Tidak ada hasil relevan ditemukan di dokumen.")
+        else:
+            pairs = list(zip(docs, metas))
+            system_msg, user_msg = build_prompt(question, pairs)
+            with st.spinner("Menyusun jawaban..."):
+                answer = openai_answer(system_msg, user_msg)
+            if answer:
+                st.markdown("### 🧾 Jawaban")
+                st.write(answer)
+                st.markdown("### 📚 Sumber yang Digunakan")
+                for i, (doc, m) in enumerate(pairs, start=1):
+                    with st.expander(f"Sumber [{i}]: {m.get('source','?')} (chunk {m.get('chunk','?')})"):
+                        st.write(doc)
